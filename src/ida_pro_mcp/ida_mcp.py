@@ -6,16 +6,24 @@ It loads the actual implementation from the ida_mcp package.
 
 import os
 import sys
+import json
 import socket
-import tempfile
 import idaapi
 from typing import TYPE_CHECKING
 
-MCP_PORT_FILE = os.path.join(tempfile.gettempdir(), "ida_mcp_port.txt")
+if TYPE_CHECKING:
+    from . import ida_mcp
 
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 13337
+MCP_SERVER_NAME = "ida-pro-mcp"
+
+# ---------------------------------------------------------------------------
+# Port helpers
+# ---------------------------------------------------------------------------
 
 def _is_port_in_use(host: str, port: int) -> bool:
-    """Check if something is already listening on the port by attempting a connection."""
+    """Return True if something is already listening on the port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.3)
         return s.connect_ex((host, port)) == 0
@@ -30,9 +38,126 @@ def _find_free_port(host: str, start_port: int, max_scan: int = 20) -> int:
     )
 
 
-if TYPE_CHECKING:
-    from . import ida_mcp
+# ---------------------------------------------------------------------------
+# MCP config registration helpers
+# ---------------------------------------------------------------------------
 
+def _mcp_config_paths() -> list[tuple[str, str]]:
+    """Return (dir, filename) pairs for known MCP client config files that exist."""
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        appdata = os.getenv("APPDATA", "")
+        candidates = [
+            (os.path.join(home, ".cursor"), "mcp.json"),
+            (os.path.join(appdata, "Claude"), "claude_desktop_config.json"),
+            (os.path.join(appdata, "Code", "User", "globalStorage",
+                          "saoudrizwan.claude-dev", "settings"), "cline_mcp_settings.json"),
+            (os.path.join(appdata, "Code", "User", "globalStorage",
+                          "rooveterinaryinc.roo-cline", "settings"), "mcp_settings.json"),
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            (os.path.join(home, ".cursor"), "mcp.json"),
+            (os.path.join(home, "Library", "Application Support", "Claude"),
+             "claude_desktop_config.json"),
+        ]
+    else:
+        candidates = [
+            (os.path.join(home, ".cursor"), "mcp.json"),
+        ]
+    return [(d, f) for d, f in candidates if os.path.exists(os.path.join(d, f))]
+
+
+def _register_mcp_server(host: str, port: int) -> list[str]:
+    """Add/update an MCP client config entry for this IDA instance.
+
+    - Default port → keep using the existing "ida-pro-mcp" entry unchanged.
+    - Non-default port → clone the existing "ida-pro-mcp" entry and add
+      "ida-pro-mcp-{port}" with the correct --ida-rpc URL.
+
+    Returns the list of config file paths that were actually updated.
+    """
+    if port == DEFAULT_PORT:
+        return []
+
+    server_name = f"{MCP_SERVER_NAME}-{port}"
+    ida_rpc_url = f"http://{host}:{port}"
+    updated: list[str] = []
+
+    for config_dir, config_file in _mcp_config_paths():
+        config_path = os.path.join(config_dir, config_file)
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            continue
+
+        servers: dict = config.get("mcpServers", {})
+        base_entry: dict | None = servers.get(MCP_SERVER_NAME)
+        if base_entry is None:
+            continue  # ida-pro-mcp not configured in this client, skip
+
+        if "url" in base_entry:
+            # HTTP-type entry — point directly at IDA's HTTP server
+            new_entry = {"type": "http", "url": f"{ida_rpc_url}/mcp"}
+        else:
+            # stdio-type entry — clone and update --ida-rpc argument
+            new_entry = dict(base_entry)
+            args: list[str] = list(new_entry.get("args", []))
+            if "--ida-rpc" in args:
+                idx = args.index("--ida-rpc")
+                if idx + 1 < len(args):
+                    args[idx + 1] = ida_rpc_url
+                else:
+                    args.append(ida_rpc_url)
+            else:
+                args += ["--ida-rpc", ida_rpc_url]
+            new_entry["args"] = args
+
+        servers[server_name] = new_entry
+        config["mcpServers"] = servers
+
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+            updated.append(config_path)
+        except Exception as e:
+            print(f"[MCP] Warning: could not update {config_path}: {e}")
+
+    return updated
+
+
+def _unregister_mcp_server(port: int) -> None:
+    """Remove the "ida-pro-mcp-{port}" entry when IDA closes (non-default port only)."""
+    if port == DEFAULT_PORT:
+        return
+
+    server_name = f"{MCP_SERVER_NAME}-{port}"
+
+    for config_dir, config_file in _mcp_config_paths():
+        config_path = os.path.join(config_dir, config_file)
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            continue
+
+        servers: dict = config.get("mcpServers", {})
+        if server_name not in servers:
+            continue
+
+        del servers[server_name]
+        config["mcpServers"] = servers
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            print(f"[MCP] Warning: could not update {config_path}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Plugin
+# ---------------------------------------------------------------------------
 
 def unload_package(package_name: str):
     """Remove every module that belongs to the package from sys.modules."""
@@ -52,9 +177,8 @@ class MCP(idaapi.plugin_t):
     wanted_name = "MCP"
     wanted_hotkey = "Ctrl-Alt-M"
 
-    # TODO: make these configurable
-    HOST = "127.0.0.1"
-    PORT = 13337
+    HOST = DEFAULT_HOST
+    PORT = DEFAULT_PORT
 
     def init(self):
         hotkey = MCP.wanted_hotkey.replace("-", "+")
@@ -65,11 +189,13 @@ class MCP(idaapi.plugin_t):
             f"[MCP] Plugin loaded, use Edit -> Plugins -> MCP ({hotkey}) to start the server"
         )
         self.mcp: "ida_mcp.rpc.McpServer | None" = None
+        self._active_port: int = self.PORT
         return idaapi.PLUGIN_KEEP
 
     def run(self, arg):
         if self.mcp:
             self.mcp.stop()
+            _unregister_mcp_server(self._active_port)
             self.mcp = None
 
         # HACK: ensure fresh load of ida_mcp package
@@ -91,24 +217,26 @@ class MCP(idaapi.plugin_t):
             MCP_SERVER.serve(
                 self.HOST, port, request_handler=IdaMcpHttpRequestHandler
             )
-            try:
-                with open(MCP_PORT_FILE, "w") as f:
-                    f.write(str(port))
-            except Exception as e:
-                print(f"[MCP] Warning: could not write port file: {e}")
+            self._active_port = port
             print(f"  Config: http://{self.HOST}:{port}/config.html")
             self.mcp = MCP_SERVER
         except OSError as e:
             print(f"[MCP] Error: {e}")
             raise
 
+        # Register this instance in MCP client configs (non-default port only)
+        updated = _register_mcp_server(self.HOST, port)
+        if updated:
+            server_name = f"{MCP_SERVER_NAME}-{port}"
+            print(f"[MCP] Added '{server_name}' to MCP client config(s):")
+            for path in updated:
+                print(f"  {path}")
+            print(f"[MCP] Reload MCP servers in your client to connect to this IDA instance")
+
     def term(self):
         if self.mcp:
             self.mcp.stop()
-            try:
-                os.remove(MCP_PORT_FILE)
-            except OSError:
-                pass
+            _unregister_mcp_server(self._active_port)
 
 
 def PLUGIN_ENTRY():
