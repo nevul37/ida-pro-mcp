@@ -14,15 +14,17 @@ from typing import TYPE_CHECKING
 MCP_PORT_FILE = os.path.join(tempfile.gettempdir(), "ida_mcp_port.txt")
 
 
+def _is_port_in_use(host: str, port: int) -> bool:
+    """Check if something is already listening on the port by attempting a connection."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex((host, port)) == 0
+
+
 def _find_free_port(host: str, start_port: int, max_scan: int = 20) -> int:
     for port in range(start_port, start_port + max_scan):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-                s.bind((host, port))
+        if not _is_port_in_use(host, port):
             return port
-        except OSError:
-            continue
     raise OSError(
         f"[MCP] No free port found in range {start_port}–{start_port + max_scan - 1}"
     )
