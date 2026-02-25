@@ -4,9 +4,29 @@ This file serves as the entry point for IDA Pro's plugin system.
 It loads the actual implementation from the ida_mcp package.
 """
 
+import os
 import sys
+import socket
+import tempfile
 import idaapi
 from typing import TYPE_CHECKING
+
+MCP_PORT_FILE = os.path.join(tempfile.gettempdir(), "ida_mcp_port.txt")
+
+
+def _find_free_port(host: str, start_port: int, max_scan: int = 20) -> int:
+    for port in range(start_port, start_port + max_scan):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+                s.bind((host, port))
+            return port
+        except OSError:
+            continue
+    raise OSError(
+        f"[MCP] No free port found in range {start_port}–{start_port + max_scan - 1}"
+    )
+
 
 if TYPE_CHECKING:
     from . import ida_mcp
@@ -63,20 +83,30 @@ class MCP(idaapi.plugin_t):
             print(f"[MCP] Cache init failed: {e}")
 
         try:
+            port = _find_free_port(self.HOST, self.PORT)
+            if port != self.PORT:
+                print(f"[MCP] Port {self.PORT} is in use, using port {port} instead")
             MCP_SERVER.serve(
-                self.HOST, self.PORT, request_handler=IdaMcpHttpRequestHandler
+                self.HOST, port, request_handler=IdaMcpHttpRequestHandler
             )
-            print(f"  Config: http://{self.HOST}:{self.PORT}/config.html")
+            try:
+                with open(MCP_PORT_FILE, "w") as f:
+                    f.write(str(port))
+            except Exception as e:
+                print(f"[MCP] Warning: could not write port file: {e}")
+            print(f"  Config: http://{self.HOST}:{port}/config.html")
             self.mcp = MCP_SERVER
         except OSError as e:
-            if e.errno in (48, 98, 10048):  # Address already in use
-                print(f"[MCP] Error: Port {self.PORT} is already in use")
-            else:
-                raise
+            print(f"[MCP] Error: {e}")
+            raise
 
     def term(self):
         if self.mcp:
             self.mcp.stop()
+            try:
+                os.remove(MCP_PORT_FILE)
+            except OSError:
+                pass
 
 
 def PLUGIN_ENTRY():

@@ -12,6 +12,16 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 import glob
 
+MCP_PORT_FILE = os.path.join(tempfile.gettempdir(), "ida_mcp_port.txt")
+
+
+def _read_ida_port(default: int) -> int:
+    try:
+        with open(MCP_PORT_FILE) as f:
+            return int(f.read().strip())
+    except Exception:
+        return default
+
 if TYPE_CHECKING:
     from ida_pro_mcp.ida_mcp.zeromcp import McpServer
     from ida_pro_mcp.ida_mcp.zeromcp.jsonrpc import JsonRpcResponse, JsonRpcRequest
@@ -41,7 +51,7 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
     elif request_obj["method"].startswith("notifications/"):
         return dispatch_original(request)
 
-    conn = http.client.HTTPConnection(IDA_HOST, IDA_PORT, timeout=30)
+    conn = http.client.HTTPConnection(IDA_HOST, _read_ida_port(IDA_PORT), timeout=30)
     try:
         if isinstance(request, dict):
             request = json.dumps(request)
