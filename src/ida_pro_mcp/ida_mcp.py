@@ -49,6 +49,7 @@ def _mcp_config_paths() -> list[tuple[str, str]]:
         appdata = os.getenv("APPDATA", "")
         candidates = [
             (os.path.join(home, ".cursor"), "mcp.json"),
+            (home, ".claude.json"),  # Claude Code
             (os.path.join(appdata, "Claude"), "claude_desktop_config.json"),
             (os.path.join(appdata, "Code", "User", "globalStorage",
                           "saoudrizwan.claude-dev", "settings"), "cline_mcp_settings.json"),
@@ -58,12 +59,14 @@ def _mcp_config_paths() -> list[tuple[str, str]]:
     elif sys.platform == "darwin":
         candidates = [
             (os.path.join(home, ".cursor"), "mcp.json"),
+            (home, ".claude.json"),  # Claude Code
             (os.path.join(home, "Library", "Application Support", "Claude"),
              "claude_desktop_config.json"),
         ]
     else:
         candidates = [
             (os.path.join(home, ".cursor"), "mcp.json"),
+            (home, ".claude.json"),  # Claude Code
         ]
     return [(d, f) for d, f in candidates if os.path.exists(os.path.join(d, f))]
 
