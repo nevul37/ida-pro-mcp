@@ -5,6 +5,7 @@ It loads the actual implementation from the ida_mcp package.
 """
 
 import os
+import re
 import sys
 import json
 import socket
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 13337
 MCP_SERVER_NAME = "ida-pro-mcp"
+
 
 # ---------------------------------------------------------------------------
 # Port helpers
@@ -71,19 +73,40 @@ def _mcp_config_paths() -> list[tuple[str, str]]:
     return [(d, f) for d, f in candidates if os.path.exists(os.path.join(d, f))]
 
 
-def _register_mcp_server(host: str, port: int) -> list[str]:
+def _get_binary_name() -> str:
+    """Return a sanitized filename of the binary currently loaded in IDA."""
+    try:
+        path = idaapi.get_input_file_path()
+        if path:
+            name = os.path.basename(path)
+            # Keep alphanumerics, dots, hyphens; replace everything else with _
+            name = re.sub(r"[^a-zA-Z0-9.\-]", "_", name)
+            name = name.strip("_.-")
+            if name:
+                return name
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _make_server_name(port: int) -> str:
+    """Build the MCP server entry name for a non-default IDA instance."""
+    binary = _get_binary_name()
+    return f"{MCP_SERVER_NAME}-{binary}-{port}"
+
+
+def _register_mcp_server(host: str, port: int) -> tuple[str, list[str]]:
     """Add/update an MCP client config entry for this IDA instance.
 
-    - Default port → keep using the existing "ida-pro-mcp" entry unchanged.
-    - Non-default port → clone the existing "ida-pro-mcp" entry and add
-      "ida-pro-mcp-{port}" with the correct --ida-rpc URL.
+    - Default port → keep the existing "ida-pro-mcp" entry unchanged.
+    - Non-default port → clone it as "ida-pro-mcp-{binary}-{port}".
 
-    Returns the list of config file paths that were actually updated.
+    Returns (server_name, list_of_updated_config_paths).
     """
     if port == DEFAULT_PORT:
-        return []
+        return MCP_SERVER_NAME, []
 
-    server_name = f"{MCP_SERVER_NAME}-{port}"
+    server_name = _make_server_name(port)
     ida_rpc_url = f"http://{host}:{port}"
     updated: list[str] = []
 
@@ -127,15 +150,13 @@ def _register_mcp_server(host: str, port: int) -> list[str]:
         except Exception as e:
             print(f"[MCP] Warning: could not update {config_path}: {e}")
 
-    return updated
+    return server_name, updated
 
 
-def _unregister_mcp_server(port: int) -> None:
-    """Remove the "ida-pro-mcp-{port}" entry when IDA closes (non-default port only)."""
-    if port == DEFAULT_PORT:
-        return
-
-    server_name = f"{MCP_SERVER_NAME}-{port}"
+def _unregister_mcp_server(server_name: str) -> None:
+    """Remove the named MCP entry from all client configs."""
+    if server_name == MCP_SERVER_NAME:
+        return  # Never remove the base entry
 
     for config_dir, config_file in _mcp_config_paths():
         config_path = os.path.join(config_dir, config_file)
@@ -193,12 +214,13 @@ class MCP(idaapi.plugin_t):
         )
         self.mcp: "ida_mcp.rpc.McpServer | None" = None
         self._active_port: int = self.PORT
+        self._registered_server_name: str = MCP_SERVER_NAME
         return idaapi.PLUGIN_KEEP
 
     def run(self, arg):
         if self.mcp:
             self.mcp.stop()
-            _unregister_mcp_server(self._active_port)
+            _unregister_mcp_server(self._registered_server_name)
             self.mcp = None
 
         # HACK: ensure fresh load of ida_mcp package
@@ -228,18 +250,18 @@ class MCP(idaapi.plugin_t):
             raise
 
         # Register this instance in MCP client configs (non-default port only)
-        updated = _register_mcp_server(self.HOST, port)
-        if updated:
-            server_name = f"{MCP_SERVER_NAME}-{port}"
+        server_name, updated_paths = _register_mcp_server(self.HOST, port)
+        self._registered_server_name = server_name
+        if updated_paths:
             print(f"[MCP] Added '{server_name}' to MCP client config(s):")
-            for path in updated:
+            for path in updated_paths:
                 print(f"  {path}")
-            print(f"[MCP] Reload MCP servers in your client to connect to this IDA instance")
+            print("[MCP] Reload MCP servers in your client to connect to this IDA instance")
 
     def term(self):
         if self.mcp:
             self.mcp.stop()
-            _unregister_mcp_server(self._active_port)
+            _unregister_mcp_server(self._registered_server_name)
 
 
 def PLUGIN_ENTRY():
